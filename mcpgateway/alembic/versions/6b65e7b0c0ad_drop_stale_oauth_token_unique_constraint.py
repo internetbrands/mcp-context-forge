@@ -43,23 +43,6 @@ _TABLE_NAME = "oauth_tokens"
 
 def _unique_constraint_exists(conn: sa.engine.Connection, table: str, constraint: str) -> bool:
     """Return True if a named unique constraint exists on the given table."""
-    dialect = conn.dialect.name.lower()
-    if dialect == "postgresql":
-        row = conn.execute(
-            sa.text(
-                "SELECT 1 FROM pg_constraint "
-                "WHERE conrelid = :table::regclass AND conname = :name AND contype = 'u'"
-            ),
-            {"table": table, "name": constraint},
-        ).fetchone()
-        return row is not None
-    if dialect == "sqlite":
-        row = conn.execute(
-            sa.text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :name"),
-            {"name": constraint},
-        ).fetchone()
-        return row is not None
-    # Generic fallback via inspector
     inspector = sa.inspect(conn)
     for uc in inspector.get_unique_constraints(table):
         if uc.get("name") == constraint:
