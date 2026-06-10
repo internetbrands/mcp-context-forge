@@ -3713,6 +3713,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         gateway_oauth_config = gateway.oauth_config
         gateway_auth_value = gateway.auth_value
         gateway_auth_query_params = gateway.auth_query_params
+        gateway_owner_email = getattr(gateway, "owner_email", None)
         health_client_cert = getattr(gateway, "client_cert", None)
         health_client_key = getattr(gateway, "client_key", None)
 
@@ -3818,32 +3819,36 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         grant_type = gateway_oauth_config.get("grant_type", "client_credentials")
 
                         if grant_type == "authorization_code":
-                            # For Authorization Code flow, try to get stored tokens
+                            # The health check runs as platform_admin_email, which may never have
+                            # authorized this gateway.  Fall back to the gateway owner's stored
+                            # token before giving up, and skip (don't penalize) if neither has one.
                             try:
                                 # First-Party
                                 from mcpgateway.services.token_storage_service import TokenStorageService  # pylint: disable=import-outside-toplevel
 
-                                # Use fresh session for OAuth token lookup
+                                access_token = None
                                 with fresh_db_session() as token_db:
                                     token_storage = TokenStorageService(token_db)
 
-                                    # Get user-specific OAuth token
-                                    if not user_email:
-                                        if span:
-                                            set_span_attribute(span, "health.status", "unhealthy")
-                                            set_span_error(span, "User email required for OAuth token")
-                                        await self._handle_gateway_failure(gateway)
-                                        return
+                                    # 1. Try the health-check identity (platform_admin_email)
+                                    if user_email:
+                                        access_token = await token_storage.get_user_token(gateway_id, user_email)
 
-                                    access_token = await token_storage.get_user_token(gateway_id, user_email)
+                                    # 2. Fall back to the gateway owner who authorized the gateway
+                                    if not access_token and gateway_owner_email and gateway_owner_email != user_email:
+                                        access_token = await token_storage.get_user_token(gateway_id, gateway_owner_email)
+                                        if access_token:
+                                            logger.debug(f"Health check for {gateway_name}: using gateway owner token ({SecurityValidator.sanitize_log_message(gateway_owner_email)})")
 
                                 if access_token:
                                     headers["Authorization"] = f"Bearer {access_token}"
                                 else:
+                                    # No token available for any known identity — skip rather than
+                                    # penalizing the gateway.  The gateway may be perfectly healthy;
+                                    # we simply lack credentials to verify it from this background context.
+                                    logger.debug(f"Skipping health check for gateway {gateway_name}: no stored OAuth token available for background health check")
                                     if span:
-                                        set_span_attribute(span, "health.status", "unhealthy")
-                                        set_span_error(span, "No valid OAuth token for user")
-                                    await self._handle_gateway_failure(gateway)
+                                        set_span_attribute(span, "health.status", "skipped")
                                     return
                             except Exception as e:
                                 logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
